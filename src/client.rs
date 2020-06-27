@@ -20,8 +20,11 @@ impl Client {
         let scheme = match uri.scheme_str() {
             Some("wss") => "wss",
             Some("ws") => "ws",
-            Some(scheme) => panic!("Invalid scheme \"{}\" in uri! should be one of \"ws\", \"wss\", or left blank to default to \"wss\"", scheme),
-            None => "wss"
+            Some(scheme) => panic!(
+                "Invalid scheme \"{}\" in uri! should be one of \"ws\", \"wss\"",
+                scheme
+            ),
+            None => unreachable!(),
         };
         let authority = if uri.port_u16().is_some() {
             uri.authority().unwrap().as_str().to_owned()

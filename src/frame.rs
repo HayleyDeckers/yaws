@@ -47,6 +47,20 @@ pub struct Frame {
     mask_len: u8,
     dynamic: [u8],
 }
+#[derive(Debug)]
+pub enum Opcode {
+    Binary,
+    Text,
+    Ping,
+    Pong,
+    Close,
+}
+
+pub enum ContentLength {
+    EightBytes,
+    TwoBytes,
+    OneByte(u8),
+}
 
 impl Frame {
     fn create_layout(dynamic_size: usize) -> Layout {
@@ -80,8 +94,23 @@ impl Frame {
     pub fn rsv3(&self) -> bool {
         (self.fin_rsv_opcode & (1 << 4)) != 0
     }
-    pub fn opcode(&self) -> u8 {
-        self.fin_rsv_opcode & 0xf
+    pub fn opcode(&self) -> Opcode {
+        let numeric = self.fin_rsv_opcode & 0xf;
+        match numeric {
+            0x8 => Opcode::Close,
+            0x9 => Opcode::Ping,
+            0xA => Opcode::Pong,
+            0x1 => Opcode::Text,
+            0x2 => Opcode::Binary,
+            x => panic!("unknown opcode {}", x),
+        }
+    }
+    pub fn ContentLengthByte(&self) -> ContentLength {
+        match self.mask_len % 128 {
+            127 => ContentLength::EightBytes,
+            126 => ContentLength::TwoBytes,
+            x => ContentLength::OneByte(x),
+        }
     }
     pub fn mask(&self) -> Option<u32> {
         if self.has_mask() {
@@ -103,18 +132,6 @@ impl Frame {
         } else {
             None
         }
-    }
-    pub fn is_close(&self) -> bool {
-        self.opcode() == 0x8
-    }
-    pub fn is_ping(&self) -> bool {
-        self.opcode() == 0x9
-    }
-    pub fn is_bin(&self) -> bool {
-        self.opcode() == 0x2
-    }
-    pub fn is_text(&self) -> bool {
-        self.opcode() == 0x1
     }
     pub fn has_mask(&self) -> bool {
         self.mask_len >= 1 << 7
@@ -255,34 +272,5 @@ impl Debug for Frame {
             .field("mask", &self.mask())
             .field("data", &self.masked_data())
             .finish()
-    }
-}
-// extern crate futures;
-// use futures::io::{AsyncRead, AsyncWrite};
-
-pub struct FrameBuilder {
-    n_bytes: usize,
-    mask: u16,
-    buffer: Vec<u8>,
-}
-
-// impl FrameBuilder {
-//     pub fn from_slice(buf: &[u8]) -> FrameBuilder {}
-// }
-
-// pub fn framed<T: AsyncWrite>(target: T) -> FrameBuilder<T> {
-//     FrameBuilder {
-//         n_bytes: 0,
-//         mask: 5, // chosen at random by dice-roll
-//         target,
-//         buffer: Vec::new(),
-//     }
-// }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
     }
 }

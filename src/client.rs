@@ -113,7 +113,7 @@ Sec-Websocket-Key: {}\r\n\r\n",
         assert_eq!(content_length, 0);
         Ok(Client {
             stream: buffered.into_inner(),
-            read_buffer: vec![0u8; 4096],
+            read_buffer: vec![0u8; 512], //needs to be atleast 2+8(+4)
             read_buffer_head: 0,
             parse_buffer_head: 0,
         })
@@ -134,15 +134,17 @@ Sec-Websocket-Key: {}\r\n\r\n",
     //then read up to 2 more bytes to determine real size
     pub async fn read_message(&mut self) -> Result<WsResponse<'_>, std::io::Error> {
         while let Err(e) = {
+            //bug: this can fail if read_buffer_head is at the end of stream.
             let bytes_read = self
                 .stream
                 .read(&mut self.read_buffer[self.read_buffer_head..])
                 .await?;
+            //shortcut to zero if we've reached eof.
+            if bytes_read == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
             self.read_buffer_head = self.read_buffer_head + bytes_read;
-            let frame = Frame::parse_slice(
-                &self.read_buffer[self.parse_buffer_head..self.read_buffer_head],
-            );
-            frame
+            Frame::parse_slice(&self.read_buffer[self.parse_buffer_head..self.read_buffer_head])
         } {
             match e {
                 crate::frame::WsParsingError::IncompleteHeader => {
@@ -175,7 +177,12 @@ Sec-Websocket-Key: {}\r\n\r\n",
                 &self.read_buffer[self.parse_buffer_head..self.read_buffer_head],
             )
         };
-        self.read_buffer_head += frame.len();
+        //if there's no data in our buffer, after this frame, we reset the read and parse head to zero.
+        // otherwise we move the parse head up.
+        if self.read_buffer_head == self.parse_buffer_head + frame.len() {
+            self.read_buffer_head = 0;
+        }
+        self.parse_buffer_head = self.read_buffer_head;
         Ok(match frame.opcode() {
             crate::frame::Opcode::Binary => WsResponse::Binary(frame.masked_data()),
             crate::frame::Opcode::Text => {

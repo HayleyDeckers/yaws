@@ -11,7 +11,8 @@ path = "src/bin.rs"
 [dependencies]
 async-tls = "0.7" #for TLS handshake for wss://
 http = "0.2" #for uri parsing
-
+flate2 = "1.0"
+erlang-term = "0.1.1"
 #for asyn tcp.
 [dependencies.async-std]
 version = "1.6"

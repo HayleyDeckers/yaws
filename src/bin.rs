@@ -3,13 +3,56 @@
 use async_std::prelude::*;
 use yaws::Client;
 pub fn main() -> Result<(), std::io::Error> {
+    let use_json = true;
     async_std::task::block_on(async {
-        let mut client = Client::connect_on("wss://gateway.discord.gg/?v=6&encoding=json")
-            .await
-            .unwrap();
+        let mut client = Client::connect_on(format!(
+            "wss://gateway.discord.gg/?v=6&encoding={}f&compress=zlib-stream",
+            if use_json { "json" } else { "etf" }
+        ))
+        .await
+        .unwrap();
         println!("connected!");
         println!("awaiting intial message..");
-        println!("{:?}", client.read_message().await.unwrap());
+        let message = client.read_message().await.unwrap();
+        println!("{:?}", message);
+        match message {
+            yaws::client::WsResponse::Binary(input) => {
+                let cmf = input[0];
+                let flg = input[1];
+                println!(
+                    "compression method: {}\ncompression info: {}",
+                    cmf & 0x0F,
+                    (cmf & 0xF0) >> 4
+                );
+                println!(
+                    "FDICT: {}\nlevel: {}",
+                    (flg & (1 << 5)) != 0,
+                    (flg >> 6) & 3
+                );
+                let mut decomp = flate2::Decompress::new(true);
+                let mut out = [0u8; 1 << 14];
+                // decomp.set_dictionary(&[0u8]);
+                println!(
+                    "{:?}",
+                    decomp
+                        .decompress(&input, &mut out, flate2::FlushDecompress::None)
+                        .unwrap(),
+                );
+                let out_size = decomp.total_out() as usize;
+                println!("Decompressed {} to {} bytes", decomp.total_in(), out_size);
+                println!("decompressed to: {:?}", &out[0..out_size]);
+                if use_json {
+                    let text = std::str::from_utf8(&out[0..out_size]).unwrap();
+                    println!("{:?}", text);
+                } else {
+                    let etf = erlang_term::parse::from_bytes(&out[0..out_size]);
+                    println!("{:?}", etf);
+                }
+            }
+            _ => {
+                println!("not binary!");
+            }
+        }
         println!("Sendding a ping");
         client.ping(Some(&[1, 2, 3, 4])).await.unwrap();
         println!("{:?}", client.read_message().await.unwrap());

@@ -9,15 +9,19 @@ use async_tls::TlsConnector;
 use http::{uri::Builder, Uri};
 pub struct Client {
     pub stream: TlsStream<TcpStream>,
+    read_buffer: Vec<u8>,
+    read_buffer_head: usize,
+    parse_buffer_head: usize,
 }
 //todo: handle paartials, esp. wrt text
 #[derive(Debug)]
-pub enum WsResponse {
-    Binary(Vec<u8>),
-    Text(String),
-    Close(Vec<u8>), //TODO: close can be zero and if not must have a code.
-    Ping(Vec<u8>),
-    Pong(Vec<u8>),
+pub enum WsResponse<'a> {
+    Binary(&'a [u8]),
+    Text(&'a str),
+    Close(&'a [u8]), //TODO: close can be zero and if not must have a code.
+    Ping(&'a [u8]),
+    Pong(&'a [u8]),
+    InvalidOpcode(&'a [u8]),
 }
 
 impl Client {
@@ -109,6 +113,9 @@ Sec-Websocket-Key: {}\r\n\r\n",
         assert_eq!(content_length, 0);
         Ok(Client {
             stream: buffered.into_inner(),
+            read_buffer: vec![0u8; 4096],
+            read_buffer_head: 0,
+            parse_buffer_head: 0,
         })
     }
 
@@ -125,38 +132,59 @@ Sec-Websocket-Key: {}\r\n\r\n",
 
     //first read 2 bytes into a fixed buffer.
     //then read up to 2 more bytes to determine real size
-    pub async fn read_message(&mut self) -> Result<WsResponse, std::io::Error> {
-        let mut header_buff = [0u8; 10];
-        self.stream.read_exact(&mut header_buff[0..2]).await?;
-        unsafe {
-            let opcode;
-            let data_size = match {
-                let frame = Frame::from_slice_unchecked(&header_buff[0..2]);
-                opcode = frame.opcode();
-                frame.ContentLengthByte()
-            } {
-                crate::frame::ContentLength::EightBytes => {
-                    self.stream.read_exact(&mut header_buff[2..10]).await?;
-                    let whole_frame = Frame::from_slice_unchecked(&header_buff);
-                    whole_frame.data_len()
+    pub async fn read_message(&mut self) -> Result<WsResponse<'_>, std::io::Error> {
+        while let Err(e) = {
+            let bytes_read = self
+                .stream
+                .read(&mut self.read_buffer[self.read_buffer_head..])
+                .await?;
+            self.read_buffer_head = self.read_buffer_head + bytes_read;
+            let frame = Frame::parse_slice(
+                &self.read_buffer[self.parse_buffer_head..self.read_buffer_head],
+            );
+            frame
+        } {
+            match e {
+                crate::frame::WsParsingError::IncompleteHeader => {
+                    //header is always small, preemptively move it back to the front of buffer
+                    self.read_buffer
+                        .copy_within(self.parse_buffer_head..self.read_buffer_head, 0);
+                    self.read_buffer_head = self.read_buffer_head - self.parse_buffer_head;
+                    self.parse_buffer_head = 0;
                 }
-                crate::frame::ContentLength::TwoBytes => {
-                    self.stream.read_exact(&mut header_buff[2..4]).await?;
-                    let whole_frame = Frame::from_slice_unchecked(&header_buff);
-                    whole_frame.data_len()
+                crate::frame::WsParsingError::IncompleteMessage(missing_bytes) => {
+                    if missing_bytes > self.read_buffer.len() - self.read_buffer_head {
+                        //message is not going to fit here, move it back to the start
+                        self.read_buffer
+                            .copy_within(self.parse_buffer_head..self.read_buffer_head, 0);
+                        self.read_buffer_head = self.read_buffer_head - self.parse_buffer_head;
+                        self.parse_buffer_head = 0;
+                    }
+                    //if it still doesn't fit, in the buffer...
+                    if missing_bytes > self.read_buffer.len() - self.read_buffer_head {
+                        self.read_buffer
+                            .resize_with(self.read_buffer_head + missing_bytes, u8::default)
+                    }
                 }
-                crate::frame::ContentLength::OneByte(x) => x as usize,
-            };
-            let mut data = Vec::with_capacity(data_size);
-            data.set_len(data_size);
-            self.stream.read_exact(&mut data).await?;
-            Ok(match opcode {
-                crate::frame::Opcode::Binary => WsResponse::Binary(data),
-                crate::frame::Opcode::Text => WsResponse::Text(String::from_utf8(data).unwrap()),
-                crate::frame::Opcode::Ping => WsResponse::Ping(data),
-                crate::frame::Opcode::Pong => WsResponse::Pong(data),
-                crate::frame::Opcode::Close => WsResponse::Close(data),
-            })
+            }
         }
+        //if we get here, then we know for certain we can cast the buffer to a frame
+        // so this is safe.
+        let frame = unsafe {
+            Frame::from_slice_unchecked(
+                &self.read_buffer[self.parse_buffer_head..self.read_buffer_head],
+            )
+        };
+        self.read_buffer_head += frame.len();
+        Ok(match frame.opcode() {
+            crate::frame::Opcode::Binary => WsResponse::Binary(frame.masked_data()),
+            crate::frame::Opcode::Text => {
+                WsResponse::Text(std::str::from_utf8(frame.masked_data()).unwrap())
+            }
+            crate::frame::Opcode::Ping => WsResponse::Ping(frame.masked_data()),
+            crate::frame::Opcode::Pong => WsResponse::Pong(frame.masked_data()),
+            crate::frame::Opcode::Close => WsResponse::Close(frame.masked_data()),
+            crate::frame::Opcode::Invalid(_) => WsResponse::InvalidOpcode(frame.masked_data()),
+        })
     }
 }

@@ -6,40 +6,18 @@
 
 //def look up what the interface is for async io in rust.
 //
-// by using fixed size frames (DST type) we could build a very memory optimized framework however. With well defined limits on its size and 'no' dynamic allocation.
-// well suited for IOT devices.
-
-//ideally: we build our frame based on Async writers (flexible, no double copy or masking problems)
-// takes an AsyncWriter ( futures::io::AsyncWrite )as input and a byte limit.
-// We then allocate a buffer for it (pref from one of several reusable arenas to allow for multithreading and such)
-// if the size is not predetermined/predeterminable such as would be the case for a streaming source.
-// we should allocate an initial buffer large enough to store at least the the header + masking key + max size.
-// after the stream terminates, or is otherwise flushed (due to timeout? or size limit being reached, we fill out the header)
-// as the header size is dynamic and needs to be the minimum size according to the spec, we cannot predetermine this without first caching
-// the whole output of the source.
-//
-// so we take a AsyncWriter, read up-to-N bytes from it into a buffer and mask it with the key.
-// then we vector I/O write the header stuff followed by the data. If there's still data left in the source, we repeat
-//
-// An optimization might be to not use vector IO but a single preallocated pointer. or a special vector struct. a list of smaller sized blocks?
-//
-// impl ASyncWriteOverWebsocket for all T : ASyncWrite, or well basically: api should be transparant. Make a websocket interface that accepts anything that's AsyncWrite.
-
-// the websocket server should be ASyncWrite.
-// anything written to it gets wrapped into a frame, then send over the physical socket
-//
-// if multiple large messages need to be send to one client (such as a shiny update, multiple elements firing at once,
-// we should wrap this in some way that makes sure that multiple can writes can be outgoing ot the same socket at once)
-// perhaps an extension, that simply wraps each message with an id and count. the receiving end should then dissassemble this.
-
-// extern crate hayley_dststore;
-// use hayley_dststore::*;
-
-// a good interface would be a binary or text based async stream.
-//
-//
-
+// by using fixed size frames (DST
 //there's a no-std vrsion of this.
+
+//we read into a [u8] buffer, check for the header.
+// then return the message as a frame, and the remainder of the slice.
+// if remainder of slice is incomplete, read into first part.
+// what if message is too big for slice?
+// increase bufferand try again
+// sometimes
+
+// can't just cast in this case cause message might get fragmented across boundaries.
+
 use std::alloc::{alloc, Layout};
 use std::fmt::Debug;
 pub struct Frame {
@@ -54,12 +32,26 @@ pub enum Opcode {
     Ping,
     Pong,
     Close,
+    Invalid(u8),
 }
 
 pub enum ContentLength {
     EightBytes,
     TwoBytes,
     OneByte(u8),
+}
+
+// casting slice to frame can fail in several ways:
+// * wrongly formatted header/not a frame
+// * header to small, minimum 2 bytes,  if 2 bytes could need more bytes to determine message size.
+// * if header is correct, then is the dynamic bit large enough?
+//      if not we could return an incomplete data segment.
+// * if it does fit, return a complete WS, and the remainder of the buffer.
+#[derive(Debug)]
+pub enum WsParsingError {
+    // NotAFrame,
+    IncompleteHeader,
+    IncompleteMessage(usize),
 }
 
 impl Frame {
@@ -82,6 +74,31 @@ impl Frame {
     pub unsafe fn from_slice_unchecked(slice: &[u8]) -> &Frame {
         std::mem::transmute::<&[u8], &Frame>(slice)
     }
+    pub fn len(&self) -> usize {
+        self.header_size() + self.data_len()
+    }
+    pub fn parse_slice(slice: &[u8]) -> Result<(&Frame, &[u8]), WsParsingError> {
+        //the minimum WS frame size is 2.
+        if slice.len() < 2 {
+            Err(WsParsingError::IncompleteHeader)
+        } else {
+            let frame_size = unsafe {
+                let frame = Self::from_slice_unchecked(slice);
+                //check if it's safe to read the size of the data segment
+                if slice.len() < frame.header_size() {
+                    return Err(WsParsingError::IncompleteHeader);
+                } else if slice.len() < frame.len() {
+                    return Err(WsParsingError::IncompleteMessage(frame.len() - slice.len()));
+                }
+                frame.header_size() + frame.data_len()
+            };
+            let (frame_slice, remainder) = slice.split_at(frame_size);
+            Ok((
+                unsafe { Self::from_slice_unchecked(frame_slice) },
+                remainder,
+            ))
+        }
+    }
     pub fn fin(&self) -> bool {
         (self.fin_rsv_opcode & 128) != 0
     }
@@ -102,7 +119,7 @@ impl Frame {
             0xA => Opcode::Pong,
             0x1 => Opcode::Text,
             0x2 => Opcode::Binary,
-            x => panic!("unknown opcode {}", x),
+            x => Opcode::Invalid(x),
         }
     }
     pub fn ContentLengthByte(&self) -> ContentLength {
@@ -136,16 +153,16 @@ impl Frame {
     pub fn has_mask(&self) -> bool {
         self.mask_len >= 1 << 7
     }
+    pub fn header_size(&self) -> usize {
+        2 + if self.has_mask() { 4 } else { 0 }
+            + match self.ContentLengthByte() {
+                ContentLength::EightBytes => 8,
+                ContentLength::TwoBytes => 2,
+                ContentLength::OneByte(_) => 0, //n.b. in the one byte case, the length is embded in the first 2 bytes
+            }
+    }
     pub fn masked_data(&self) -> &[u8] {
-        let len = self.mask_len % 128;
-        let offset = if self.has_mask() { 4 } else { 0 }
-            + if len == 127 {
-                8
-            } else if len == 126 {
-                2
-            } else {
-                0
-            };
+        let offset = self.header_size() - 2;
         &self.dynamic[offset..offset + self.data_len()]
     }
     pub fn is_final(&self) -> bool {

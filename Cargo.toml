@@ -9,11 +9,20 @@ name = "mybin"
 path = "src/bin.rs"
 
 [dependencies]
-async-tls = "0.7" #for TLS handshake for wss://
+#async-tls = "0.7" #for TLS handshake for wss://
 http = "0.2" #for uri parsing
-flate2 = "1.0"
-erlang-term = "0.1.1"
-#for asyn tcp.
-[dependencies.async-std]
-version = "1.6"
-features = ["unstable"]
+flate2 = "1.0" #decompression
+erlang-term = "0.1.1" #parsing erlang
+futures-util = "0.3.5"
+
+
+#todo: only use features we use.
+tokio = { version = "0.2", features = ["full"] }
+#for wss and https streams
+rustls = {version ="0.18", features = ["logging"]}
+tokio-rustls = "0.14"
+# for certificates, use mozilla <3
+webpki-roots = "0.20"
+#for DNS name stuff
+webpki = "0.21"
+pretty_env_logger ="0.4"

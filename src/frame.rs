@@ -1,23 +1,3 @@
-//make a frame a singular entity in ram? requires a deep copy of message before sending data. Could use an api where Frame is _like_ a vector. Having a capacity and size.
-// OR: give frame reference to the data, keeping the header part seperate? (could use both types)
-
-// some messages can be reused, here a reference type would win out in performance, unless we don't consume frames.
-// using in place frames saves on programming complexity however. Allows move-everywhere when we don't have to reuse messages.
-
-//def look up what the interface is for async io in rust.
-//
-// by using fixed size frames (DST
-//there's a no-std vrsion of this.
-
-//we read into a [u8] buffer, check for the header.
-// then return the message as a frame, and the remainder of the slice.
-// if remainder of slice is incomplete, read into first part.
-// what if message is too big for slice?
-// increase bufferand try again
-// sometimes
-
-// can't just cast in this case cause message might get fragmented across boundaries.
-
 use std::alloc::{alloc, Layout};
 use std::fmt::Debug;
 pub struct Frame {
@@ -47,7 +27,7 @@ pub enum ContentLength {
 // * if header is correct, then is the dynamic bit large enough?
 //      if not we could return an incomplete data segment.
 // * if it does fit, return a complete WS, and the remainder of the buffer.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum WsParsingError {
     // NotAFrame,
     IncompleteHeader,
@@ -71,6 +51,7 @@ impl Frame {
         };
         boxed_ptr
     }
+    //note, this takes the whole slice, even if the message is only a small part.
     pub unsafe fn from_slice_unchecked(slice: &[u8]) -> &Frame {
         std::mem::transmute::<&[u8], &Frame>(slice)
     }
@@ -122,6 +103,20 @@ impl Frame {
             x => Opcode::Invalid(x),
         }
     }
+    pub fn is_close(&self) -> bool {
+        match self.opcode() {
+            Opcode::Close => true,
+            _ => false,
+        }
+    }
+    pub fn close_code(&self) -> Option<u16> {
+        if self.is_close() && self.data_len() >= 2 {
+            let data = self.unmasked_data();
+            Some(u16::from_be_bytes([data[0], data[1]]))
+        } else {
+            None
+        }
+    }
     pub fn ContentLengthByte(&self) -> ContentLength {
         match self.mask_len % 128 {
             127 => ContentLength::EightBytes,
@@ -164,6 +159,13 @@ impl Frame {
     pub fn masked_data(&self) -> &[u8] {
         let offset = self.header_size() - 2;
         &self.dynamic[offset..offset + self.data_len()]
+    }
+    pub fn unmasked_data(&self) -> &[u8] {
+        if self.has_mask() {
+            panic!("not implemented yet!");
+        } else {
+            self.masked_data()
+        }
     }
     pub fn is_final(&self) -> bool {
         self.fin_rsv_opcode >= 1 << 7
@@ -287,7 +289,24 @@ impl Debug for Frame {
             .field("payload_len", &(self.mask_len & 127))
             .field("real payload_len", &self.data_len())
             .field("mask", &self.mask())
-            .field("data", &self.masked_data())
+            .field("data", &{
+                let data = self.masked_data();
+                let string = match self.opcode() {
+                    Opcode::Binary | Opcode::Invalid(_) => format!("[{} bytes]", data.len()),
+                    Opcode::Text => match String::from_utf8(data.to_vec()) {
+                        Ok(x) => x.to_owned(),
+                        Err(_) => "[malformed string]".to_owned(),
+                    },
+                    Opcode::Close | Opcode::Ping | Opcode::Pong => {
+                        if data.len() >= 2 {
+                            format!("[{}]", u16::from_be_bytes([data[0], data[1]]))
+                        } else {
+                            "[no closing code given]".to_owned()
+                        }
+                    }
+                };
+                string
+            })
             .finish()
     }
 }

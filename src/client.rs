@@ -9,7 +9,7 @@ use tokio::io::{
     split, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf,
 };
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Client<S> {
     stream: S,
     read_buffer: Vec<u8>,
@@ -46,9 +46,9 @@ impl Client<TcpStream> {
             .build()
             .unwrap();
         //https://docs.rs/async-tls/0.7.0/async_tls/struct.TlsConnector.html
-        println!("Connecting to {}", uri);
+        // println!("Connecting to {}", uri);
         let mut stream = TcpStream::connect(uri.authority().unwrap().as_str()).await?;
-        println!("Connected to authority");
+        // println!("Connected to authority");
         //let (sink, source) = encrypted_stream.split();
         let upgrade_request = format!(
             "GET {} HTTP/1.1\r
@@ -58,25 +58,25 @@ Upgrade: websocket\r
 Sec-Websocket-Version: 13\r
 Sec-Websocket-Key: {}\r\n\r\n",
             uri.path_and_query().unwrap(),
-            host,
+            authority,
             "dGhlIHNhbXBsZSBub25jZQ=="
         );
-        println!("request\n=======\n{}", upgrade_request);
+        // println!("request\n=======\n{}", upgrade_request);
         stream.write_all(upgrade_request.as_bytes()).await?;
         let mut header_pairs = std::collections::HashMap::new();
         let mut buffered = BufReader::new(stream);
         {
             let mut line = String::new();
             buffered.read_line(&mut line).await?;
-            println!("received header line: {}", line);
+            // println!("received header line: {}", line);
             let split = line.split(" ").collect::<Vec<_>>();
             assert_eq!("HTTP/1.1", split[0]);
             assert_eq!("101", split[1]);
             line.clear();
             while buffered.read_line(&mut line).await? > 2 {
                 let split = line.splitn(2, ":").collect::<Vec<_>>();
-                println!("Key: \"{}\"", split[0].to_lowercase());
-                println!("Value: \"{}\"", split[1].trim());
+                // println!("Key: \"{}\"", split[0].to_lowercase());
+                // println!("Value: \"{}\"", split[1].trim());
                 //todo: header can have duplicate keys.
                 assert_eq!(
                     None,
@@ -94,14 +94,17 @@ Sec-Websocket-Key: {}\r\n\r\n",
             .unwrap_or(0);
         //todo skip body
         assert_eq!(content_length, 0);
+        let vec = buffered.buffer().to_owned();
         Ok(Client {
             stream: buffered.into_inner(),
-            read_buffer: vec![0u8; 4096], //needs to be atleast 2+8(+4)
-            read_buffer_head: 0,
+            read_buffer_head: vec.len(),
+            read_buffer: vec,
             parse_buffer_head: 0,
         })
     }
 }
+
+pub type SecureClient = Client<TlsStream<TcpStream>>;
 
 impl Client<TlsStream<TcpStream>> {
     pub async fn connect_secure<U: Into<String>>(uri: U) -> Result<Self, std::io::Error> {
@@ -132,19 +135,19 @@ impl Client<TlsStream<TcpStream>> {
             .build()
             .unwrap();
         //https://docs.rs/async-tls/0.7.0/async_tls/struct.TlsConnector.html
-        println!("Connecting to {}", uri);
+        //println!("Connecting to {}", uri);
         let tcp_stream = TcpStream::connect(uri.authority().unwrap().as_str()).await?;
-        println!("Connected to authority");
+        //println!("Connected to authority");
         let mut config = ClientConfig::new();
-        println!(
-            "dns {:?} from {}",
-            webpki::DNSNameRef::try_from_ascii_str(host),
-            host
-        );
+        // println!(
+        //     "dns {:?} from {}",
+        //     webpki::DNSNameRef::try_from_ascii_str(host),
+        //     host
+        // );
         config
             .root_store
             .add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
-        println!("{:?}", config.ciphersuites);
+        //println!("{:?}", config.ciphersuites);
         let connector = TlsConnector::from(std::sync::Arc::new(config));
         let mut encrypted_stream = connector
             .connect(
@@ -152,7 +155,7 @@ impl Client<TlsStream<TcpStream>> {
                 tcp_stream,
             )
             .await?;
-        println!("encryption added");
+        //println!("encryption added");
         //let (sink, source) = encrypted_stream.split();
         let upgrade_request = format!(
             "GET {} HTTP/1.1\r
@@ -162,10 +165,10 @@ Upgrade: websocket\r
 Sec-Websocket-Version: 13\r
 Sec-Websocket-Key: {}\r\n\r\n",
             uri.path_and_query().unwrap(),
-            host,
+            authority,
             "dGhlIHNhbXBsZSBub25jZQ=="
         );
-        println!("request\n=======\n{}", upgrade_request);
+        //println!("request\n=======\n{}", upgrade_request);
         encrypted_stream
             .write_all(upgrade_request.as_bytes())
             .await?;
@@ -174,15 +177,15 @@ Sec-Websocket-Key: {}\r\n\r\n",
         {
             let mut line = String::new();
             buffered.read_line(&mut line).await?;
-            println!("received header line: {}", line);
+            //println!("received header line: {}", line);
             let split = line.split(" ").collect::<Vec<_>>();
             assert_eq!("HTTP/1.1", split[0]);
             assert_eq!("101", split[1]);
             line.clear();
             while buffered.read_line(&mut line).await? > 2 {
                 let split = line.splitn(2, ":").collect::<Vec<_>>();
-                println!("Key: \"{}\"", split[0].to_lowercase());
-                println!("Value: \"{}\"", split[1].trim());
+                //println!("Key: \"{}\"", split[0].to_lowercase());
+                //println!("Value: \"{}\"", split[1].trim());
                 //todo: header can have duplicate keys.
                 assert_eq!(
                     None,
@@ -220,15 +223,33 @@ impl<Stream: std::marker::Unpin + AsyncWriteExt> Client<Stream> {
         self.stream.write_all(frame.as_bytes()).await
     }
 
+    pub async fn pong(&mut self, data: Option<&[u8]>) -> Result<(), std::io::Error> {
+        let frame = Frame::new_pong(data, Some(0));
+        self.stream.write_all(frame.as_bytes()).await
+    }
+
     pub async fn send_str<S: AsRef<str>>(&mut self, msg: S) -> Result<(), std::io::Error> {
         let frame = Frame::new_text(msg, Some(0));
-        println!("Sending frame: {:?}", frame);
+        //println!("Sending frame: {:?}", frame);
         self.stream.write_all(frame.as_bytes()).await
     }
     pub async fn send_binary(&mut self, msg: &[u8]) -> Result<(), std::io::Error> {
-        let frame = Frame::new_binary(msg, Some(0));
-        println!("Sending frame: {:?}", frame);
-        self.stream.write_all(frame.as_bytes()).await
+        let max_frame_size: usize = 1 << 16;
+        if msg.len() < max_frame_size {
+            let frame = Frame::new_binary(&msg, Some(0), true);
+            self.stream.write_all(frame.as_bytes()).await
+        } else {
+            let frame = Frame::new_binary(&msg[0..max_frame_size], Some(0), false);
+            self.stream.write_all(frame.as_bytes()).await?;
+            for start in (max_frame_size..msg.len()).step_by(max_frame_size) {
+                let frame =
+                    Frame::new_continuation(&msg[start..start + max_frame_size], Some(0), false);
+                self.stream.write_all(frame.as_bytes()).await?;
+            }
+            let frame = Frame::new_continuation(&[], Some(0), true);
+            self.stream.write_all(frame.as_bytes()).await?;
+            Ok(())
+        }
     }
 }
 
@@ -252,11 +273,11 @@ impl<Stream: std::marker::Unpin + AsyncReadExt> Client<Stream> {
                 self.parse_buffer_head = 0;
             }
             crate::frame::WsParsingError::IncompleteMessage(missing_bytes) => {
-                println!(
-                    "missing {} bytes and {} free",
-                    missing_bytes,
-                    self.read_buffer.len() - self.read_buffer_head
-                );
+                // println!(
+                //     "missing {} bytes and {} free",
+                //     missing_bytes,
+                //     self.read_buffer.len() - self.read_buffer_head
+                // );
                 if missing_bytes > self.read_buffer.len() - self.read_buffer_head {
                     //message is not going to fit here, move it back to the start
                     self.read_buffer
@@ -266,7 +287,7 @@ impl<Stream: std::marker::Unpin + AsyncReadExt> Client<Stream> {
                 }
                 //if it still doesn't fit, in the buffer...
                 if missing_bytes > self.read_buffer.len() - self.read_buffer_head {
-                    println!("resizing to {}", self.read_buffer_head + missing_bytes);
+                    // println!("resizing to {}", self.read_buffer_head + missing_bytes);
                     self.read_buffer
                         .resize_with(self.read_buffer_head + missing_bytes, u8::default);
                 }
@@ -293,18 +314,24 @@ impl<Stream: std::marker::Unpin + AsyncReadExt> Client<Stream> {
     pub async fn read_message(&mut self) -> Result<&Frame, std::io::Error> {
         //maybe return usize of frame size instead on succes? easier to do borrows cause drops dependence.
         while let None = self.peek_frame_from_buffer() {
+            // println!("starting read from {}", self.read_buffer_head);
             let bytes_read = self
                 .stream
                 .read(&mut self.read_buffer[self.read_buffer_head..])
                 .await?;
-            println!("\t Read {} bytes", bytes_read);
+            // println!("\t Read {} bytes", bytes_read);
             //shortcut to zero if we've reached eof.
             if bytes_read == 0 {
+                // println!("Connection got closed!");
                 return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
             }
             self.read_buffer_head = self.read_buffer_head + bytes_read;
         }
         let frame = unsafe {
+            // println!(
+            //     "Making a frame from {} to {}",
+            //     self.parse_buffer_head, self.read_buffer_head
+            // );
             Frame::from_slice_unchecked(
                 &self.read_buffer[self.parse_buffer_head..self.read_buffer_head],
             )
@@ -318,6 +345,9 @@ impl<Stream: std::marker::Unpin + AsyncReadExt> Client<Stream> {
         Ok(frame)
     }
 }
+
+pub type SecureReader = Client<ReadHalf<TlsStream<TcpStream>>>;
+pub type SecureWriter = Client<WriteHalf<TlsStream<TcpStream>>>;
 
 impl<Stream: std::marker::Unpin + AsyncReadExt + AsyncWriteExt> Client<Stream> {
     pub fn split(self) -> (Client<ReadHalf<Stream>>, Client<WriteHalf<Stream>>) {

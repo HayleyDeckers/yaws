@@ -5,8 +5,9 @@ pub struct Frame {
     mask_len: u8,
     dynamic: [u8],
 }
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Opcode {
+    Continue,
     Binary,
     Text,
     Ping,
@@ -33,8 +34,43 @@ pub enum WsParsingError {
     IncompleteHeader,
     IncompleteMessage(usize),
 }
+/*The fragments of one message MUST NOT be interleaved between the
+      fragments of another message unless an extension has been
+      negotiated that can interpret the interleaving.
 
+   o  An endpoint MUST be capable of handling control frames in the
+      middle of a fragmented message.
+
+*/
 impl Frame {
+    pub fn is_valid(&self) -> bool {
+        if self.rsv1()
+            || self.rsv2()
+            || self.rsv3()
+            || self.has_mask()
+            || self.data_len() > ((1 << 63) - 1)
+        {
+            false
+        } else if !match self.opcode() {
+            Opcode::Close | Opcode::Ping | Opcode::Pong => {
+                if (self.data_len() > 125) | !self.fin() {
+                    false
+                } else {
+                    true
+                }
+            }
+            Opcode::Invalid(_) => false,
+            Opcode::Binary | Opcode::Text | Opcode::Continue => true,
+        } {
+            false
+        } else {
+            match self.content_length_bytes() {
+                ContentLength::TwoBytes => (self.data_len() >= 126),
+                ContentLength::EightBytes => (self.data_len() >= (1 << 16 - 1)),
+                _ => true,
+            }
+        }
+    }
     fn create_layout(dynamic_size: usize) -> Layout {
         Layout::array::<u8>(2 + dynamic_size).unwrap()
     }
@@ -95,6 +131,7 @@ impl Frame {
     pub fn opcode(&self) -> Opcode {
         let numeric = self.fin_rsv_opcode & 0xf;
         match numeric {
+            0x0 => Opcode::Continue,
             0x8 => Opcode::Close,
             0x9 => Opcode::Ping,
             0xA => Opcode::Pong,
@@ -109,6 +146,12 @@ impl Frame {
             _ => false,
         }
     }
+    pub fn is_control(&self) -> bool {
+        match self.opcode() {
+            Opcode::Close | Opcode::Ping | Opcode::Pong => true,
+            _ => false,
+        }
+    }
     pub fn close_code(&self) -> Option<u16> {
         if self.is_close() && self.data_len() >= 2 {
             let data = self.unmasked_data();
@@ -117,7 +160,7 @@ impl Frame {
             None
         }
     }
-    pub fn ContentLengthByte(&self) -> ContentLength {
+    pub fn content_length_bytes(&self) -> ContentLength {
         match self.mask_len % 128 {
             127 => ContentLength::EightBytes,
             126 => ContentLength::TwoBytes,
@@ -150,7 +193,7 @@ impl Frame {
     }
     pub fn header_size(&self) -> usize {
         2 + if self.has_mask() { 4 } else { 0 }
-            + match self.ContentLengthByte() {
+            + match self.content_length_bytes() {
                 ContentLength::EightBytes => 8,
                 ContentLength::TwoBytes => 2,
                 ContentLength::OneByte(_) => 0, //n.b. in the one byte case, the length is embded in the first 2 bytes
@@ -191,8 +234,16 @@ impl Frame {
             len as usize
         }
     }
-    fn new_raw(buf: &[u8], mask: Option<u32>, opcode: u8) -> Box<Frame> {
-        let fin_rsv_opcode = (1 << 7) | opcode;
+    //TODO: make a function to generate just the header, or construct header in place.
+    // unsafeish, but can save a copy
+    fn new_raw(buf: &[u8], mask: Option<u32>, opcode: u8, is_final: bool) -> Box<Frame> {
+        let fin_rsv_opcode = {
+            if is_final {
+                1 << 7
+            } else {
+                0
+            }
+        } | opcode;
         let payload_length: u8 = if buf.len() <= 125 {
             buf.len() as u8
         } else if buf.len() <= (1 << 16) - 1 {
@@ -226,13 +277,13 @@ impl Frame {
             }
             payload_idx += 2;
         } else if payload_length == 127 {
-            if payload_length == 126 {
-                let size = (buf.len() as u64).to_be_bytes();
-                for i in 0..size.len() {
-                    this.dynamic[payload_idx + i] = size[i];
-                }
-                payload_idx += 8;
+            // if payload_length == 126 {
+            let size = (buf.len() as u64).to_be_bytes();
+            for i in 0..size.len() {
+                this.dynamic[payload_idx + i] = size[i];
             }
+            payload_idx += 8;
+            // }
         }
         let mask_array = mask.unwrap_or(0).to_be_bytes();
         if mask.is_some() {
@@ -247,16 +298,22 @@ impl Frame {
         this
     }
     pub fn new_close(code: Option<u16>, mask: Option<u32>) -> Box<Frame> {
-        Self::new_raw(&code.unwrap_or(1000).to_be_bytes(), mask, 0x8)
+        Self::new_raw(&code.unwrap_or(1000).to_be_bytes(), mask, 0x8, true)
     }
-    pub fn new_binary(buf: &[u8], mask: Option<u32>) -> Box<Frame> {
-        Self::new_raw(buf, mask, 0x2)
+    pub fn new_binary(buf: &[u8], mask: Option<u32>, is_final: bool) -> Box<Frame> {
+        Self::new_raw(buf, mask, 0x2, is_final)
+    }
+    pub fn new_continuation(buf: &[u8], mask: Option<u32>, is_final: bool) -> Box<Frame> {
+        Self::new_raw(buf, mask, 0x0, is_final)
     }
     pub fn new_ping(buf: Option<&[u8]>, mask: Option<u32>) -> Box<Frame> {
-        Self::new_raw(buf.unwrap_or(&[]), mask, 0x9)
+        Self::new_raw(buf.unwrap_or(&[]), mask, 0x9, true)
+    }
+    pub fn new_pong(buf: Option<&[u8]>, mask: Option<u32>) -> Box<Frame> {
+        Self::new_raw(buf.unwrap_or(&[]), mask, 0xA, true)
     }
     pub fn new_text<S: AsRef<str>>(buf: S, mask: Option<u32>) -> Box<Frame> {
-        Self::new_raw(buf.as_ref().as_bytes(), mask, 0x1)
+        Self::new_raw(buf.as_ref().as_bytes(), mask, 0x1, true)
     }
     pub fn as_bytes(&self) -> &[u8] {
         unsafe {
@@ -292,7 +349,9 @@ impl Debug for Frame {
             .field("data", &{
                 let data = self.masked_data();
                 let string = match self.opcode() {
-                    Opcode::Binary | Opcode::Invalid(_) => format!("[{} bytes]", data.len()),
+                    Opcode::Continue | Opcode::Binary | Opcode::Invalid(_) => {
+                        format!("[{} bytes]", data.len())
+                    }
                     Opcode::Text => match String::from_utf8(data.to_vec()) {
                         Ok(x) => x.to_owned(),
                         Err(_) => "[malformed string]".to_owned(),
